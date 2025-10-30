@@ -125,7 +125,7 @@ class ImprovedHierarchicalAttentionModel(nn.Module):
                  tanh_clipping=10.,
                  mask_inner=True,
                  mask_logits=True,
-                 normalization='batch',
+                 normalization='instance',
                  n_heads=8,
                  checkpoint_encoder=False,
                  shrink_size=None,
@@ -274,7 +274,7 @@ class ImprovedHierarchicalAttentionModel(nn.Module):
 
             # ===== 上层决策 =====
             context = self._build_context(
-                graph_embedding, selected_mask, step, total_p
+                graph_embedding, embeddings, selected_mask, step, total_p
             )
 
             option_logits = self.option_actor(
@@ -303,16 +303,14 @@ class ImprovedHierarchicalAttentionModel(nn.Module):
             option_sequences.append(facilities_to_select)
 
             # ===== 下层决策（使用KV缓存） =====
+            kv_cache = None  # 每个上层步单独的下层历史
             action_log_p, selected_facilities, state, kv_cache = self._select_facilities_cached(
                 fixed, state, facilities_to_select, selected_mask,
                 graph_embedding, step, kv_cache
             )
 
-            # 更新已选择掩码
-            for i, indices in enumerate(selected_facilities):
-                for idx in indices:
-                    if idx > 0:
-                        selected_mask[i, idx] = True
+                        # 使用环境状态更新已选掩码，避免占位索引歧义
+            selected_mask = state.get_mask()
 
             action_outputs.extend(action_log_p)
             action_sequences.extend(selected_facilities)
@@ -346,11 +344,11 @@ class ImprovedHierarchicalAttentionModel(nn.Module):
         selected_facilities = []
 
         # 初始查询
-        num_to_select = facilities_to_select.float().mean()
+        num_to_select = facilities_to_select.float().unsqueeze(1)  # [B,1] 按样本传入
         task_embedding = self.context_fusion(torch.cat([
             graph_embedding,
             self.first_query.unsqueeze(0).expand(batch_size, -1),
-            num_to_select.view(1, 1).expand(batch_size, 1)
+            num_to_select
         ], dim=-1))
 
         decoder_input = task_embedding.unsqueeze(1)
@@ -362,7 +360,7 @@ class ImprovedHierarchicalAttentionModel(nn.Module):
                 break
 
             # 添加位置编码
-            pos_encoded_input = decoder_input + self.pos_encoder(torch.zeros(1, 1, 1, device=device)).squeeze(0)
+            pos_encoded_input = decoder_input + self.pos_encoder.pe[:, i:i+1, :]  # 使用步号i的位置编码
 
             # 使用KV缓存的解码器
             decoder_output, kv_cache = self.action_decoder(
@@ -416,7 +414,7 @@ class ImprovedHierarchicalAttentionModel(nn.Module):
 
         return action_log_p, selected_facilities, state, kv_cache
 
-    def _build_context(self, graph_embedding, selected_mask, step, total_p):
+    def _build_context(self, graph_embedding, node_embeddings, selected_mask, step, total_p):
         """构建上下文信息"""
         batch_size = graph_embedding.size(0)
         device = graph_embedding.device
@@ -428,9 +426,12 @@ class ImprovedHierarchicalAttentionModel(nn.Module):
         step_tensor = torch.full((batch_size, 1), step_ratio, device=device)
         remaining_tensor = torch.full((batch_size, 1), remaining_ratio, device=device)
 
-        # 使用已选择设施的嵌入作为解决方案表示
+        # 使用已选择设施的嵌入的平均作为解决方案表示（更有信息量）
         if selected_mask.any():
-            solution_embedding = graph_embedding * selected_ratio
+            # selected_mask: True=已选；node_embeddings: [B, N, E]
+            sel = selected_mask.float()  # 1=已选
+            denom = torch.clamp(sel.sum(dim=1, keepdim=True), min=1.0)
+            solution_embedding = (node_embeddings * sel.unsqueeze(-1)).sum(dim=1) / denom
         else:
             solution_embedding = torch.zeros_like(graph_embedding)
 
